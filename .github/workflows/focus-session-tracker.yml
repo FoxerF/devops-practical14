@@ -1,0 +1,184 @@
+name: Focus Session Tracker CI/CD
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'students/FoxerF/**'
+      - '.github/workflows/focus-session-tracker.yml'
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: focus-session-tracker-deploy
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: ./students/FoxerF
+          file: ./students/FoxerF/Dockerfile
+          push: true
+          tags: |
+            ${{ secrets.DOCKER_USERNAME }}/focus-session-tracker:${{ github.sha }}
+            ${{ secrets.DOCKER_USERNAME }}/focus-session-tracker:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v4
+
+      - name: Terraform plan and apply
+        working-directory: students/FoxerF/infra
+        env:
+          TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+          TF_VAR_ssh_public_key: ${{ secrets.EC2_SSH_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+
+          terraform init -input=false \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="key=focus-session-tracker/terraform.tfstate" \
+            -backend-config="region=us-east-1" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+          terraform fmt -check
+          terraform validate
+
+          terraform plan -input=false -out=pr14.tfplan
+
+          terraform apply -input=false -auto-approve pr14.tfplan
+
+          echo "EC2_HOST=$(terraform output -raw public_ip)" >> "$GITHUB_ENV"
+
+      - name: Configure SSH
+        env:
+          EC2_HOST: ${{ env.EC2_HOST }}
+          EC2_SSH_KEY_B64: ${{ secrets.EC2_SSH_KEY_B64 }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          printf '%s' "$EC2_SSH_KEY_B64" \
+            | base64 --decode > ~/.ssh/focus-tracker-key
+
+          chmod 600 ~/.ssh/focus-tracker-key
+
+          key_ready=false
+
+          for attempt in $(seq 1 30); do
+            if ssh-keyscan -T 5 -H "$EC2_HOST" \
+              >> ~/.ssh/known_hosts 2>/dev/null; then
+              key_ready=true
+              break
+            fi
+
+            echo "Waiting for SSH to become available..."
+            sleep 5
+          done
+
+          if [ "$key_ready" != "true" ]; then
+            echo "Could not obtain the EC2 SSH host key."
+            exit 1
+          fi
+
+      - name: Wait for EC2 initialization
+        env:
+          EC2_HOST: ${{ env.EC2_HOST }}
+        run: |
+          ssh -i ~/.ssh/focus-tracker-key \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            "ubuntu@${EC2_HOST}" \
+            "cloud-init status --wait && sudo docker version"
+
+      - name: Deploy application to EC2
+        env:
+          EC2_HOST: ${{ env.EC2_HOST }}
+          IMAGE: ${{ secrets.DOCKER_USERNAME }}/focus-session-tracker
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          ssh -i ~/.ssh/focus-tracker-key \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            "ubuntu@${EC2_HOST}" \
+            "IMAGE='${IMAGE}' IMAGE_TAG='${IMAGE_TAG}' bash -s" <<'REMOTE_SCRIPT'
+
+          set -euo pipefail
+
+          echo "Pulling the new Docker image..."
+
+          sudo docker pull "${IMAGE}:${IMAGE_TAG}"
+
+          echo "Creating persistent data volume..."
+
+          sudo docker volume create focus-session-data >/dev/null
+
+          echo "Removing previous container..."
+
+          sudo docker rm -f focus-session-tracker >/dev/null 2>&1 || true
+
+          echo "Starting the new application container..."
+
+          sudo docker run -d \
+            --name focus-session-tracker \
+            --restart unless-stopped \
+            --publish 3000:3000 \
+            --mount source=focus-session-data,target=/app/data \
+            --env PORT=3000 \
+            --env DATA_FILE=/app/data/sessions.json \
+            "${IMAGE}:${IMAGE_TAG}"
+
+          echo "Checking application health..."
+
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --max-time 5 \
+              http://127.0.0.1:3000/health > /dev/null; then
+
+              echo "Application health check passed!"
+              sudo docker ps --filter name=focus-session-tracker
+              exit 0
+            fi
+
+            echo "Waiting for application... (${attempt}/30)"
+            sleep 2
+          done
+
+          echo "Application failed its health check."
+
+          sudo docker logs focus-session-tracker
+
+          exit 1
+
+          REMOTE_SCRIPT
